@@ -6,6 +6,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 option(LIVOX_LANE_DETECTION_WITH_TORCH "Build the TorchScript C++ inference executable" ON)
+option(
+  LIVOX_LANE_DETECTION_ALLOW_PYTHON_TORCH
+  "Allow building against a Python wheel's torch CMake package. This is usually unsafe for the C++ node."
+  OFF)
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -24,6 +28,18 @@ if(LIVOX_LANE_DETECTION_WITH_TORCH)
   endif()
 
   list(REMOVE_DUPLICATES _livox_lane_detection_torch_search_paths)
+
+  if(_livox_lane_detection_torch_search_paths AND NOT LIVOX_LANE_DETECTION_ALLOW_PYTHON_TORCH)
+    foreach(_torch_search_path IN LISTS _livox_lane_detection_torch_search_paths)
+      if(_torch_search_path MATCHES "site-packages.*/torch/share/cmake/Torch")
+        message(FATAL_ERROR
+          "livox_lane_detection was asked to build against Python wheel Torch at "
+          "${_torch_search_path}. This often produces runtime symbol lookup errors. "
+          "Use /opt/libtorch/share/cmake/Torch or set "
+          "LIVOX_LANE_DETECTION_ALLOW_PYTHON_TORCH=ON if you really want this.")
+      endif()
+    endforeach()
+  endif()
 
   if(_livox_lane_detection_torch_search_paths)
     find_package(Torch QUIET CONFIG PATHS ${_livox_lane_detection_torch_search_paths} NO_DEFAULT_PATH)

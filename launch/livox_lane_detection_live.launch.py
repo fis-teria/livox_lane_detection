@@ -2,7 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -18,6 +18,7 @@ def generate_launch_description():
     objects_topic = LaunchConfiguration("objects_topic")
     output_frame = LaunchConfiguration("output_frame")
     launch_livox_driver = LaunchConfiguration("launch_livox_driver")
+    torch_lib_path = LaunchConfiguration("torch_lib_path")
 
     return LaunchDescription(
         [
@@ -58,11 +59,26 @@ def generate_launch_description():
                 default_value="false",
                 description="Whether to also launch livox_ros_driver2 HAP driver",
             ),
+            DeclareLaunchArgument(
+                "torch_lib_path",
+                default_value="/opt/libtorch/lib",
+                description=(
+                    "libtorch runtime library directory to prepend for the C++ node. "
+                    "Keep this ahead of Python wheel torch libs."
+                ),
+            ),
             Node(
                 package="livox_lane_detection",
                 executable="livox_lane_detection_live_node",
                 name="livox_lane_detection_live",
                 output="screen",
+                additional_env={
+                    "LD_LIBRARY_PATH": [
+                        torch_lib_path,
+                        ":",
+                        EnvironmentVariable("LD_LIBRARY_PATH", default_value=""),
+                    ],
+                },
                 parameters=[
                     {
                         "model_path": model_path,
