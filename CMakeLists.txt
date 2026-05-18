@@ -51,6 +51,14 @@ if(LIVOX_LANE_DETECTION_WITH_TORCH)
   endif()
 
   if(Torch_FOUND)
+    set(_livox_lane_detection_has_torch_cuda OFF)
+    if(DEFINED Torch_DIR AND NOT "${Torch_DIR}" STREQUAL "")
+      get_filename_component(_livox_lane_detection_torch_prefix "${Torch_DIR}/../../.." ABSOLUTE)
+      if(EXISTS "${_livox_lane_detection_torch_prefix}/lib/libtorch_cuda.so")
+        set(_livox_lane_detection_has_torch_cuda ON)
+      endif()
+    endif()
+
     add_executable(livox_lane_detection_node
       src/livox_lane_detection_node.cpp
     )
@@ -69,6 +77,10 @@ if(LIVOX_LANE_DETECTION_WITH_TORCH)
     target_link_libraries(livox_lane_detection_live_node "${TORCH_LIBRARIES}")
     target_compile_definitions(livox_lane_detection_node PRIVATE TORCH_API_INCLUDE_EXTENSION_H)
     target_compile_definitions(livox_lane_detection_live_node PRIVATE TORCH_API_INCLUDE_EXTENSION_H)
+    if(_livox_lane_detection_has_torch_cuda)
+      target_compile_definitions(livox_lane_detection_node PRIVATE LIVOX_LANE_DETECTION_TORCH_CUDA=1)
+      target_compile_definitions(livox_lane_detection_live_node PRIVATE LIVOX_LANE_DETECTION_TORCH_CUDA=1)
+    endif()
     set_property(TARGET livox_lane_detection_node PROPERTY CXX_STANDARD 17)
     set_property(TARGET livox_lane_detection_live_node PROPERTY CXX_STANDARD 17)
     install(TARGETS livox_lane_detection_node livox_lane_detection_live_node

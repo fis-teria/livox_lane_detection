@@ -4,6 +4,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -19,6 +20,13 @@ def generate_launch_description():
     output_frame = LaunchConfiguration("output_frame")
     launch_livox_driver = LaunchConfiguration("launch_livox_driver")
     torch_lib_path = LaunchConfiguration("torch_lib_path")
+    publish_colored_cloud = LaunchConfiguration("publish_colored_cloud")
+    publish_lane_scan = LaunchConfiguration("publish_lane_scan")
+    publish_obstacles = LaunchConfiguration("publish_obstacles")
+    publish_timing_log = LaunchConfiguration("publish_timing_log")
+    timing_log_interval_sec = LaunchConfiguration("timing_log_interval_sec")
+    max_process_rate_hz = LaunchConfiguration("max_process_rate_hz")
+    device = LaunchConfiguration("device")
 
     return LaunchDescription(
         [
@@ -64,8 +72,43 @@ def generate_launch_description():
                 default_value="/opt/libtorch/lib",
                 description=(
                     "libtorch runtime library directory to prepend for the C++ node. "
-                    "Keep this ahead of Python wheel torch libs."
+                    "CUDA builds can pass a colon-separated torch/nvjitlink library path."
                 ),
+            ),
+            DeclareLaunchArgument(
+                "publish_colored_cloud",
+                default_value="false",
+                description="Publish classified PointCloud2 output.",
+            ),
+            DeclareLaunchArgument(
+                "publish_lane_scan",
+                default_value="true",
+                description="Publish lane/road-edge LaserScan output.",
+            ),
+            DeclareLaunchArgument(
+                "publish_obstacles",
+                default_value="false",
+                description="Publish obstacle JSON output.",
+            ),
+            DeclareLaunchArgument(
+                "publish_timing_log",
+                default_value="true",
+                description="Log per-stage processing timings.",
+            ),
+            DeclareLaunchArgument(
+                "timing_log_interval_sec",
+                default_value="2.0",
+                description="Minimum interval between timing log lines.",
+            ),
+            DeclareLaunchArgument(
+                "max_process_rate_hz",
+                default_value="5.0",
+                description="Maximum lane-detection processing rate. 0 disables throttling.",
+            ),
+            DeclareLaunchArgument(
+                "device",
+                default_value="cuda:0",
+                description="Torch inference device. Falls back to CPU when CUDA is unavailable.",
             ),
             Node(
                 package="livox_lane_detection",
@@ -83,9 +126,25 @@ def generate_launch_description():
                     {
                         "model_path": model_path,
                         "lidar_ids": ["6"],
-                        "publish_colored_cloud": True,
-                        "publish_lane_scan": True,
-                        "publish_obstacles": True,
+                        "publish_colored_cloud": ParameterValue(
+                            publish_colored_cloud, value_type=bool
+                        ),
+                        "publish_lane_scan": ParameterValue(
+                            publish_lane_scan, value_type=bool
+                        ),
+                        "publish_obstacles": ParameterValue(
+                            publish_obstacles, value_type=bool
+                        ),
+                        "publish_timing_log": ParameterValue(
+                            publish_timing_log, value_type=bool
+                        ),
+                        "timing_log_interval_sec": ParameterValue(
+                            timing_log_interval_sec, value_type=float
+                        ),
+                        "max_process_rate_hz": ParameterValue(
+                            max_process_rate_hz, value_type=float
+                        ),
+                        "device": device,
                         "output_frame": output_frame,
                         # These IDs should be tuned to your trained model's label map.
                         "scan_class_ids": [3, 29],

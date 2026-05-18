@@ -1,7 +1,12 @@
 #include <torch/script.h>
+#if defined(LIVOX_LANE_DETECTION_TORCH_CUDA)
+#include <torch/cuda.h>
+#endif
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -24,6 +29,79 @@
 
 namespace
 {
+
+using SteadyClock = std::chrono::steady_clock;
+
+double MillisecondsBetween(
+  const SteadyClock::time_point & start,
+  const SteadyClock::time_point & end)
+{
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+std::string ToLowerAscii(std::string value)
+{
+  std::transform(
+    value.begin(), value.end(), value.begin(),
+    [](unsigned char c) {return static_cast<char>(std::tolower(c));});
+  return value;
+}
+
+torch::Device ResolveTorchDevice(const std::string & requested_device, const rclcpp::Logger & logger)
+{
+  const auto requested = ToLowerAscii(requested_device);
+  const auto cuda_requested = requested == "auto" || requested == "cuda" ||
+    requested.rfind("cuda:", 0) == 0;
+
+  if (!cuda_requested) {
+    return torch::Device(torch::kCPU);
+  }
+
+  bool cuda_available = false;
+#if defined(LIVOX_LANE_DETECTION_TORCH_CUDA)
+  try {
+    cuda_available = torch::cuda::is_available();
+  } catch (const c10::Error & error) {
+    RCLCPP_WARN(
+      logger, "CUDA availability check failed, falling back to CPU: %s", error.what());
+  }
+#else
+  if (requested != "auto") {
+    RCLCPP_WARN(
+      logger,
+      "Requested livox_lane_detection device '%s' but this node was built with CPU-only "
+      "libtorch. Falling back to CPU.",
+      requested_device.c_str());
+  }
+#endif
+
+  if (!cuda_available) {
+#if defined(LIVOX_LANE_DETECTION_TORCH_CUDA)
+    if (requested != "auto") {
+      RCLCPP_WARN(
+        logger,
+        "Requested livox_lane_detection device '%s' but CUDA is not available in this "
+        "libtorch/runtime. Falling back to CPU.",
+        requested_device.c_str());
+    }
+#endif
+    return torch::Device(torch::kCPU);
+  }
+
+  int device_index = 0;
+  if (requested.rfind("cuda:", 0) == 0) {
+    try {
+      device_index = std::stoi(requested.substr(5));
+    } catch (const std::exception & error) {
+      RCLCPP_WARN(
+        logger, "Invalid CUDA device '%s' (%s), using cuda:0.",
+        requested_device.c_str(), error.what());
+      device_index = 0;
+    }
+  }
+
+  return torch::Device(torch::kCUDA, device_index);
+}
 
 struct PointXYZI
 {
@@ -202,7 +280,10 @@ torch::Tensor ForwardModule(torch::jit::script::Module & module, torch::Tensor i
   throw std::runtime_error("TorchScript module returned an unsupported type.");
 }
 
-std::vector<std::int64_t> RunInference(torch::jit::script::Module & module, const BvTensor & bv_data)
+std::vector<std::int64_t> RunInference(
+  torch::jit::script::Module & module,
+  const BvTensor & bv_data,
+  const torch::Device & device)
 {
   torch::NoGradGuard no_grad;
 
@@ -211,6 +292,9 @@ std::vector<std::int64_t> RunInference(torch::jit::script::Module & module, cons
     const_cast<float *>(bv_data.data.data()),
     {1, 2, bv_data.height, bv_data.width},
     options).clone();
+  if (device.type() != torch::kCPU) {
+    input = input.to(device);
+  }
 
   auto output = ForwardModule(module, input);
   auto label_map = output.argmax(1).squeeze().to(torch::kCPU).contiguous();
@@ -477,8 +561,13 @@ public:
     this->declare_parameter<double>("scan_inf_epsilon", 1.0);
     this->declare_parameter<double>("obstacle_cell_size", 0.75);
     this->declare_parameter<int>("obstacle_min_points", 8);
+    this->declare_parameter<bool>("publish_timing_log", true);
+    this->declare_parameter<double>("timing_log_interval_sec", 2.0);
+    this->declare_parameter<double>("max_process_rate_hz", 0.0);
+    this->declare_parameter<std::string>("device", "cpu");
 
     const auto model_path = this->get_parameter("model_path").as_string();
+    const auto requested_device = this->get_parameter("device").as_string();
     lidar_ids_ = this->get_parameter("lidar_ids").as_string_array();
     publish_colored_cloud_ = this->get_parameter("publish_colored_cloud").as_bool();
     publish_lane_scan_ = this->get_parameter("publish_lane_scan").as_bool();
@@ -495,6 +584,13 @@ public:
     scan_inf_epsilon_ = static_cast<float>(this->get_parameter("scan_inf_epsilon").as_double());
     obstacle_cell_size_ = static_cast<float>(this->get_parameter("obstacle_cell_size").as_double());
     obstacle_min_points_ = this->get_parameter("obstacle_min_points").as_int();
+    publish_timing_log_ = this->get_parameter("publish_timing_log").as_bool();
+    timing_log_interval_ms_ = std::max(
+      100,
+      static_cast<int>(
+        std::round(this->get_parameter("timing_log_interval_sec").as_double() * 1000.0)));
+    max_process_rate_hz_ = std::max(0.0, this->get_parameter("max_process_rate_hz").as_double());
+    inference_device_ = ResolveTorchDevice(requested_device, this->get_logger());
 
     if (model_path.empty()) {
       throw std::runtime_error("Parameter model_path must be set.");
@@ -505,10 +601,27 @@ public:
     try {
       module_ = torch::jit::load(model_path);
       module_.eval();
+      try {
+        module_.to(inference_device_);
+      } catch (const c10::Error & error) {
+        if (inference_device_.type() != torch::kCPU) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "Failed to move livox_lane_detection model to '%s', falling back to CPU: %s",
+            requested_device.c_str(), error.what());
+          inference_device_ = torch::Device(torch::kCPU);
+          module_.to(inference_device_);
+        } else {
+          throw;
+        }
+      }
     } catch (const c10::Error & error) {
       throw std::runtime_error(
               "Failed to load TorchScript model '" + model_path + "': " + error.what());
     }
+    RCLCPP_INFO(
+      this->get_logger(), "livox_lane_detection loaded model=%s device=%s max_process_rate_hz=%.2f",
+      model_path.c_str(), inference_device_.str().c_str(), max_process_rate_hz_);
 
     subscription_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       "cloud_in",
@@ -531,7 +644,19 @@ public:
 private:
   void CloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
   {
+    const auto total_start = SteadyClock::now();
+    if (max_process_rate_hz_ > 0.0 && has_last_process_start_) {
+      const auto elapsed_sec =
+        std::chrono::duration<double>(total_start - last_process_start_).count();
+      if (elapsed_sec < (1.0 / max_process_rate_hz_)) {
+        return;
+      }
+    }
+    last_process_start_ = total_start;
+    has_last_process_start_ = true;
+
     auto points = ReadPointsFromCloud(*msg);
+    const auto read_done = SteadyClock::now();
     if (points.empty()) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 5000,
@@ -540,6 +665,7 @@ private:
     }
 
     const auto bv_data = ProduceBvData(points, common_settings_, range_settings_);
+    const auto bv_done = SteadyClock::now();
 
     if (bv_data.width <= 0 || bv_data.height <= 0) {
       RCLCPP_WARN_THROTTLE(
@@ -549,13 +675,21 @@ private:
     }
 
     std::vector<float> point_classes;
+    double inference_ms = 0.0;
+    double classify_ms = 0.0;
     {
       std::lock_guard<std::mutex> lock(module_mutex_);
-      const auto label_map = RunInference(module_, bv_data);
+      const auto inference_start = SteadyClock::now();
+      const auto label_map = RunInference(module_, bv_data, inference_device_);
+      const auto inference_done = SteadyClock::now();
       point_classes = GetPointsClassFromBv(
         points, label_map, common_settings_, range_settings_, bv_data.width, bv_data.height);
+      const auto classify_done = SteadyClock::now();
+      inference_ms = MillisecondsBetween(inference_start, inference_done);
+      classify_ms = MillisecondsBetween(inference_done, classify_done);
     }
 
+    const auto colored_start = SteadyClock::now();
     if (publish_colored_cloud_) {
       auto header = msg->header;
       if (!output_frame_.empty()) {
@@ -563,7 +697,9 @@ private:
       }
       colored_cloud_pub_->publish(BuildColoredCloud(points, point_classes, header));
     }
+    const auto colored_done = SteadyClock::now();
 
+    const auto scan_start = SteadyClock::now();
     if (publish_lane_scan_ && lane_scan_pub_ != nullptr && !scan_class_ids_.empty()) {
       auto header = msg->header;
       if (!output_frame_.empty()) {
@@ -582,12 +718,36 @@ private:
           scan_use_inf_,
           scan_inf_epsilon_));
     }
+    const auto scan_done = SteadyClock::now();
 
+    const auto objects_start = SteadyClock::now();
     if (publish_obstacles_ && obstacle_pub_ != nullptr && !obstacle_class_ids_.empty()) {
       std_msgs::msg::String objects_msg;
       objects_msg.data = BuildObjectsJson(
         points, point_classes, obstacle_class_ids_, obstacle_cell_size_, obstacle_min_points_);
       obstacle_pub_->publish(objects_msg);
+    }
+    const auto objects_done = SteadyClock::now();
+
+    if (publish_timing_log_) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), timing_log_interval_ms_,
+        "livox_lane_detection timing total_ms=%.2f points=%zu bv=%dx%d read_ms=%.2f "
+        "bv_ms=%.2f inference_ms=%.2f classify_ms=%.2f colored_ms=%.2f scan_ms=%.2f "
+        "objects_ms=%.2f device=%s frame=%s",
+        MillisecondsBetween(total_start, objects_done),
+        points.size(),
+        bv_data.width,
+        bv_data.height,
+        MillisecondsBetween(total_start, read_done),
+        MillisecondsBetween(read_done, bv_done),
+        inference_ms,
+        classify_ms,
+        MillisecondsBetween(colored_start, colored_done),
+        MillisecondsBetween(scan_start, scan_done),
+        MillisecondsBetween(objects_start, objects_done),
+        inference_device_.str().c_str(),
+        msg->header.frame_id.c_str());
     }
   }
 
@@ -609,6 +769,12 @@ private:
   float scan_inf_epsilon_ {1.0F};
   float obstacle_cell_size_ {0.75F};
   int obstacle_min_points_ {8};
+  bool publish_timing_log_ {true};
+  int timing_log_interval_ms_ {2000};
+  double max_process_rate_hz_ {0.0};
+  bool has_last_process_start_ {false};
+  SteadyClock::time_point last_process_start_ {};
+  torch::Device inference_device_ {torch::kCPU};
   torch::jit::script::Module module_;
   std::mutex module_mutex_;
 
